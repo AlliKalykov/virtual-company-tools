@@ -3,6 +3,13 @@ from datetime import datetime
 from typing import Annotated, Literal
 from urllib.parse import quote
 
+import httpx
+from httpx import Auth
+
+from pydantic import JsonValue
+from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_fixed
+
+import logging
 from pydantic import BaseModel
 
 
@@ -275,3 +282,94 @@ class IPATHandler(ABC):
 
 
 AuthHandler = IOAuthHandler | IPATHandler
+
+
+class IntegrationBase(ABC):
+    """Common settings and methods for integrations"""
+
+    def __init__(self, api_url: str = ''):
+        """api_url (str | None, optional): api url address to connect"""
+        self.creds: str | None = None
+        if not api_url:
+            raise Exception('API URL is required')
+
+        self.client: httpx.AsyncClient = httpx.AsyncClient()
+        self.api_url: str = api_url
+        self.authorisationStrategy: Auth | None = None
+        self.logger: logging.Logger = logging.getLogger(self.__class__.__name__)
+        self.httpx_request_timeout: int = 30
+        # tenacity retry settings
+        self.http_error_retry_codes: list[int] = []
+        self.retry_attempts_count: int = 3
+        self.delay_in_seconds_between_retries: int = 1
+
+    @abstractmethod
+    async def get_auth_headers(self) -> dict[str, str]:
+        """Get auth headers for the API call"""
+        return {}
+
+    async def call_api(
+        self,
+        endpoint: str,
+        method: Literal['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] = 'GET',
+        data: dict[str, JsonValue] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        """
+        Make a non-blocking API call to the specified endpoint.
+        Retries the call if errors occur, and logs any 400 errors.
+
+        Args:
+            endpoint (str): The endpoint to make the API call to
+            method (Literal["GET", "POST", "PUT", "DELETE", "PATCH"], optional):
+            The HTTP method to use. Defaults to "GET".
+            data (dict[str, Any] | None, optional): The data to send with the request. Defaults to None.
+            params (dict[str, Any] | None, optional): The query parameters to send with the request.
+            Defaults to None.
+
+        Returns:
+            httpx.Response: The response from the API call
+        """
+        url = f'{self.api_url}{endpoint}'
+        headers = await self.get_auth_headers()
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(self.retry_attempts_count),
+            wait=wait_fixed(self.delay_in_seconds_between_retries),
+            retry=retry_if_exception(
+                lambda r: isinstance(r, httpx.HTTPStatusError)
+                and r.response.status_code in self.http_error_retry_codes,
+            ),
+        ):
+            response = None
+            with attempt:
+                attempt = 0
+                try:
+                    self.logger.debug(f'Calling API at {url} using {method}')
+                    response = await self.client.request(
+                        method,
+                        url,
+                        headers=headers,
+                        json=data,
+                        params=params,
+                        auth=self.authorisationStrategy,
+                        timeout=self.httpx_request_timeout,
+                    )
+                    self.logger.debug(f'response status code {response.status_code}, response text: {response.text}')
+                    # raise an exception if status code 4** or 5**
+                    _ = response.raise_for_status()
+                    return response
+
+                except httpx.HTTPStatusError as http_err:
+                    # handle error from response.raise_for_status()
+                    self.logger.error(
+                        f'HTTP error: {http_err} response: {response.text if response else "No response"} {data}',
+                        exc_info=http_err,
+                    )
+                    raise http_err
+
+                except Exception as err:
+                    # handle all other errors
+                    self.logger.exception(f'Unexpected error: {err}')
+                    self.logger.error(f'Unexpected error: {err}', exc_info=err)
+                    raise err
+        raise Exception('Max retries reached')
