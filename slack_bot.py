@@ -48,7 +48,7 @@ def slack_get_users(auth: TokenAuth) -> list[dict[str, Any]]:
     users = []
     cursor = None
     while True:
-        response = client.users_list(cursor=cursor)
+        response = client.users_list(cursor=cursor, limit=10)
         users.extend(response['members'])
         cursor = response.get('response_metadata', {}).get('next_cursor')
         if not cursor:
