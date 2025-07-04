@@ -1,8 +1,10 @@
 import os
 import json
 import logging
+import http.client
+import time
 from datetime import datetime, timedelta
-from typing import Annotated, Any
+from typing import Any
 from dotenv import load_dotenv
 
 from slack_sdk import WebClient
@@ -34,10 +36,24 @@ def slack_get_channel_info(auth: TokenAuth, channel_id: str) -> dict[str, Any]:
     return client.conversations_info(channel=channel_id)['channel']
 
 
-def slack_get_channel_history(auth: TokenAuth, channel_id: str, limit: int) -> list[dict[str, Any]]:
-    print(f"channel history: {channel_id}")
+def slack_get_channel_history(auth: TokenAuth, channel_id: str, max_total: int = 10000) -> list[dict[str, Any]]:
     client = _get_client(auth.token)
-    return client.conversations_history(channel=channel_id, limit=limit)['messages']
+    messages = []
+    cursor = None
+
+    while True:
+        response = client.conversations_history(
+            channel=channel_id,
+            limit=200,  # максимум допустимый Slack
+            cursor=cursor
+        )
+        messages.extend(response['messages'])
+        cursor = response.get('response_metadata', {}).get('next_cursor')
+
+        if not cursor or len(messages) >= max_total:
+            break
+
+    return messages[:max_total]  # ограничим, если нужно
 
 
 def slack_get_channel_members(auth: TokenAuth, channel_id: str) -> list[str]:
@@ -51,18 +67,30 @@ def slack_get_users(auth: TokenAuth, member_ids: list[str]) -> list[dict[str, An
     client = _get_client(auth.token)
     users = []
     cursor = None
+
     while True:
-        response = client.users_list(cursor=cursor, limit=200)
-        for user in response['members']:
+        try:
+            response = client.users_list(cursor=cursor, limit=100)
+        except http.client.IncompleteRead as e:
+            print(f"IncompleteRead error: {e}, retrying in 2 seconds...")
+            time.sleep(2)
+            continue
+        except Exception as e:
+            print(f"Other error during users_list: {e}")
+            break
+
+        for user in response.get('members', []):
             if (
                 user.get("id") in member_ids and
                 not user.get("deleted", False) and
                 not user.get("is_bot", False)
             ):
                 users.append(user)
+
         cursor = response.get('response_metadata', {}).get('next_cursor')
         if not cursor:
             break
+
     return users
 
 
@@ -131,7 +159,7 @@ auth = TokenAuth(
 )
 
 channel_info = slack_get_channel_info(auth, CHANNEL_ID)
-messages = slack_get_channel_history(auth, CHANNEL_ID, 100)
+messages = slack_get_channel_history(auth, CHANNEL_ID, 200)
 members = slack_get_channel_members(auth, CHANNEL_ID)
 users = slack_get_users(auth, members)
 
